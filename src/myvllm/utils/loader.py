@@ -22,6 +22,8 @@ def load_weights_from_checkpoint(model: nn.Module, model_name_or_path: str):
         model: The target model to load weights into
         model_name_or_path: Path to local checkpoint or Hugging Face model name
     """
+    if hasattr(model, 'load_checkpoint'):
+        return model.load_checkpoint(model_name_or_path)
     from huggingface_hub import snapshot_download
 
     # Try to resolve the path - could be local or from HF cache

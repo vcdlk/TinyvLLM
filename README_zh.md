@@ -103,3 +103,4 @@ myvllm/
 ## Star History
 
 [![Star History Chart](https://star-history.dera.page/svg?repos=Wenyueh/MinivLLM&type=date&legend=top-left)](https://star-history.dera.page/?utm_source=chatgpt.com#Wenyueh/MinivLLM&type=date&legend=top-left)
+MiniMind-3-MoE 的实验性单卡 eager 支持、文件级设计、CPU 数值结果和 GPU 验收步骤见 [支持说明](docs/minimind-3-moe-support.md)。Linux CUDA 示例：`python main_minimind.py`；Mac 可使用说明中的独立 CPU 测试环境。
