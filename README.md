@@ -15,6 +15,25 @@ Benchmarking on flash attention in prefilling time and paged attention in decodi
 
 **New to vLLM?** Check out [HowToApproachvLLM.md](HowToApproachvLLM.md) for a step-by-step implementation guide covering layers, models, paged attention, CUDA graphs, and scheduling.
 
+## Chunked prefill and unified scheduling
+
+Enabled by default: running requests and waiting prompts share one token budget,
+with long inputs split across iterations. KV blocks grow with each chunk; only
+completed inputs are sampled. Qwen3 and Llama use absolute positions and paged
+history during variable-length attention. Pure decode retains CUDA graphs.
+
+Optionally set `long_prefill_token_threshold` to cap each request’s per-step work
+(default 0: unlimited). Use `python3 benchmark_scheduling.py --dry-run` to preview
+the GPU benchmark plan; remove `--dry-run` to measure TTFT, ITL and output throughput.
+
+Set `max_num_batched_tokens` to control the per-iteration input budget, which may
+be smaller than a prompt. KV blocks are private to each request; cross-request
+prefix caching is not supported in this implementation.
+
+See the [design notes and vLLM references](docs/unified_scheduling.md). Run
+`python3 -m unittest discover -s tests -v`; CUDA numerical tests are explicitly
+skipped when the required GPU environment is unavailable.
+
 ## Quickstart
 
 ```bash

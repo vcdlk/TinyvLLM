@@ -1,49 +1,28 @@
-# Scheduler Tests
+# Scheduler and chunked attention tests
 
-## Setup
+Run the full suite from the repository root:
 
 ```bash
-pip install pytest xxhash
+python3 -m unittest discover -s tests -v
 ```
 
-## Run
+`test_scheduler.py` uses only the standard library. It preserves coverage for
+requests lost at token/sequence limits and during tail preemption, and adds
+chunked prefill, unified mixed batches, deferred sampling, incremental block
+allocation, stopping conditions, replay after preemption, TP serialization,
+a per-request chunk cap, and randomized block ownership/conservation checks.
 
-All tests:
-```bash
-python3 -m pytest tests/test_scheduler.py -v
-```
+`test_scheduling_benchmark.py` uses a simulated GPU clock to verify that TTFT
+includes delayed admission, ITL excludes intermediate prefill chunks, and throughput
+counts completion tokens. It also covers idle arrival periods and one-token outputs.
 
-A specific class:
-```bash
-python3 -m pytest tests/test_scheduler.py::TestBug2TokenLimitBreak -v
-python3 -m pytest tests/test_scheduler.py::TestBug1CanAppendFailure -v
-python3 -m pytest tests/test_scheduler.py::TestSchedulerHappyPath -v
-```
+`test_chunked_attention.py` requires PyTorch, Triton and CUDA. Without them, its
+four numerical/model tests are explicitly skipped. On a GPU it compares paged
+attention with a dense causal reference, and compares Qwen3/Llama full-prefill
+logits and generated tokens against chunked/mixed execution. It also exercises
+the transition from a mixed batch to decode CUDA graphs. No model download is
+required. The model tests initialize a single-rank NCCL group; multi-rank TP
+still needs a separate integration run.
 
-## Test Classes
-
-### TestBug2TokenLimitBreak
-
-Guards against sequences being silently dropped when the token budget (or sequence-count limit) is exhausted mid-loop.
-
-Tests:
-- `test_seq_count_is_correct` — only 2 sequences fit in a 2-token budget; `seq_c` must remain in `running`
-- `test_seq_count_limit_variant` — same bug triggered by `max_num_sequences` instead of token budget
-- `test_no_sequence_is_lost` — total sequence conservation: every sequence must be in `running`, `waiting`, or `scheduled`
-
-### TestBug1CanAppendFailure
-
-Guards against sequences being lost when `block_manager.can_append` returns `False`.
-
-Tests:
-- `test_seq_a_not_lost` — `seq_a` must appear in `running`, `waiting`, or `scheduled` after the call
-- `test_total_conservation` — neither `seq_a` nor `seq_b` may disappear
-
-### TestSchedulerHappyPath
-
-Basic correctness of the scheduler under normal conditions.
-
-Tests:
-- `test_prefill_scheduled_first` — a newly added sequence is scheduled as prefill and moved to `running`
-- `test_all_running_seqs_scheduled_when_budget_allows` — when the token budget is large enough, all running sequences are scheduled and remain in `running`
-- `test_preempt_only_seq_when_cant_append_and_running_empty` — when the only running sequence cannot append, it is preempted to `waiting` with status `WAITING`
+See [the design notes](../docs/unified_scheduling.md) for scheduling semantics
+and current limitations.

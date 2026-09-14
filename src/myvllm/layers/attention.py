@@ -112,7 +112,12 @@ def store_kvcache(
 def flash_attention_varlen_kernel(
     Q, K, V, O,
     cu_seqlens_q_ptr,
+    context_lens_ptr,
+    block_tables_ptr,
     scale,
+    PAGED: tl.constexpr,
+    cache_block_size: tl.constexpr,
+    table_width: tl.constexpr,
     num_heads: tl.constexpr,
     num_kv_heads: tl.constexpr,
     head_dim: tl.constexpr,
@@ -135,6 +140,8 @@ def flash_attention_varlen_kernel(
     seq_start = tl.load(cu_seqlens_q_ptr + seq_idx)
     seq_end = tl.load(cu_seqlens_q_ptr + seq_idx + 1)
     seq_len = seq_end - seq_start
+    kv_len = tl.load(context_lens_ptr + seq_idx) if PAGED else seq_len
+    prefix_len = kv_len - seq_len
     
     # Early exit if this block is beyond sequence length
     if start_m * BLOCK_M >= seq_len:
@@ -157,7 +164,7 @@ def flash_attention_varlen_kernel(
     acc = tl.zeros([BLOCK_M, head_dim], dtype=tl.float32)
     
     # Number of blocks to process
-    num_blocks = tl.cdiv(seq_len, BLOCK_N)
+    num_blocks = tl.cdiv(kv_len, BLOCK_N)
     
     # Loop over K, V blocks
     for block_n in range(num_blocks):
@@ -165,10 +172,17 @@ def flash_attention_varlen_kernel(
         offs_n = start_n + tl.arange(0, BLOCK_N)
         
         # Mask for valid positions
-        mask_n = offs_n < seq_len
+        mask_n = offs_n < kv_len
         
         # K pointers: K has shape (total_tokens, num_kv_heads, head_dim)
-        k_ptrs = K + (seq_start + offs_n[None, :]) * num_kv_heads * head_dim + kv_head_idx * head_dim + offs_d[:, None]
+        if PAGED:
+            physical_block = tl.load(
+                block_tables_ptr + seq_idx * table_width + offs_n // cache_block_size,
+                mask=mask_n, other=0).to(tl.int64)
+            kv_slots = physical_block * cache_block_size + offs_n % cache_block_size
+        else:
+            kv_slots = seq_start + offs_n
+        k_ptrs = K + kv_slots[None, :] * num_kv_heads * head_dim + kv_head_idx * head_dim + offs_d[:, None]
         
         # Load K block - shape (head_dim, BLOCK_N)
         k = tl.load(k_ptrs, mask=mask_n[None, :], other=0.0)
@@ -178,7 +192,7 @@ def flash_attention_varlen_kernel(
         qk = qk * scale
         
         # Apply causal mask: only attend to positions <= current position
-        mask_causal = (offs_m[:, None] + seq_start) >= (offs_n[None, :] + seq_start)
+        mask_causal = (prefix_len + offs_m[:, None]) >= offs_n[None, :]
         qk = tl.where(mask_causal & mask_n[None, :], qk, -1e10)
         
         # Online softmax update
@@ -191,7 +205,7 @@ def flash_attention_varlen_kernel(
         acc = acc * alpha[:, None]
         
         # Load V block - shape (BLOCK_N, head_dim)
-        v_ptrs = V + (seq_start + offs_n[:, None]) * num_kv_heads * head_dim + kv_head_idx * head_dim + offs_d[None, :]
+        v_ptrs = V + kv_slots[:, None] * num_kv_heads * head_dim + kv_head_idx * head_dim + offs_d[None, :]
         v = tl.load(v_ptrs, mask=mask_n[:, None], other=0.0)
         
         # Accumulate weighted values
@@ -218,6 +232,9 @@ def flash_attention_prefill(
     num_heads: int,
     num_kv_heads: int,
     head_dim: int,
+    block_tables: torch.Tensor | None = None,
+    context_lens: torch.Tensor | None = None,
+    max_seqlen_q: int | None = None,
 ) -> torch.Tensor:
     """
     Optimized Flash Attention for prefill phase with variable-length sequences.
@@ -260,16 +277,22 @@ def flash_attention_prefill(
     num_seqs = cu_seqlens.shape[0] - 1
     
     # Find max sequence length to determine grid size
-    cu_seqlens_cpu = cu_seqlens.cpu()
-    max_seq_len = (cu_seqlens_cpu[1:] - cu_seqlens_cpu[:-1]).max().item()
+    if max_seqlen_q is None:
+        cu_seqlens_cpu = cu_seqlens.cpu()
+        max_seqlen_q = (cu_seqlens_cpu[1:] - cu_seqlens_cpu[:-1]).max().item()
     
     # Calculate grid dimensions - launch all kernels at once
-    grid = (triton.cdiv(max_seq_len, BLOCK_M), num_heads, num_seqs)
+    grid = (triton.cdiv(max_seqlen_q, BLOCK_M), num_heads, num_seqs)
     
     flash_attention_varlen_kernel[grid](
         q, k, v, output,
         cu_seqlens,
+        context_lens,
+        block_tables,
         scale,
+        PAGED=block_tables is not None,
+        cache_block_size=k.shape[1] if block_tables is not None else 1,
+        table_width=block_tables.shape[1] if block_tables is not None else 0,
         num_heads=num_heads,
         num_kv_heads=num_kv_heads,
         head_dim=head_dim,
@@ -387,7 +410,7 @@ def paged_attention_decode_kernel(
             m_i = m_i_new
     
     # Normalize
-    output = acc / l_i
+    output = acc / tl.maximum(l_i, 1e-20)
     
     # Store output
     output_offset = batch_idx * num_heads * head_dim + head_idx * head_dim + offs_d
@@ -497,8 +520,14 @@ class Attention(nn.Module):
             if cu_seqlens is None:
                 raise ValueError("cu_seqlens_q must be provided for varlen attention")
             
-            o = flash_attention_prefill(q, k, v, cu_seqlens, scale, 
-                                        self.num_heads, self.num_kv_heads, self.head_dim)
+            paged = context.block_tables is not None
+            o = flash_attention_prefill(
+                q, k_cache if paged else k, v_cache if paged else v,
+                cu_seqlens, scale, self.num_heads, self.num_kv_heads, self.head_dim,
+                block_tables=context.block_tables,
+                context_lens=context.context_lens,
+                max_seqlen_q=context.max_seqlen_q or None,
+            )
             # Output: (total_tokens, num_heads, head_dim) -> (total_tokens, num_heads * head_dim)
             return o.reshape(o.shape[0], self.num_heads * self.head_dim)
         else:

@@ -27,8 +27,8 @@ class Sequence:
         # num_tokens, num_prompt_tokens
         self.num_tokens = len(self.token_ids)
         self.num_prompt_tokens = len(self.token_ids)
-        # num_cached_tokens = 0
-        self.num_cached_tokens = 0
+        # Number of tokens whose KV has actually been computed (not reserved).
+        self.num_computed_tokens = 0
         # block_table
         self.block_table = []
         # sampling_params' related things
@@ -42,6 +42,15 @@ class Sequence:
 
     def __getitem__(self, idx):
         return self.token_ids[idx]
+
+    @property
+    def num_cached_tokens(self):
+        """Compatibility name for the computed prefix length."""
+        return self.num_computed_tokens
+
+    @num_cached_tokens.setter
+    def num_cached_tokens(self, value):
+        self.num_computed_tokens = value
 
     @property
     def is_finished(self):
@@ -86,29 +95,9 @@ class Sequence:
         self.num_tokens += 1 
 
     def __getstate__(self):
-        return (
-            self.num_tokens, 
-            self.num_prompt_tokens, 
-            self.num_cached_tokens, 
-            self.block_table,
-            self.token_ids if self.num_completion_tokens == 0 else self.last_token
-        )
+        # A preempted request must replay prompt AND previously generated tokens.
+        # Sending only last_token on decode loses that history on TP workers.
+        return self.__dict__.copy()
 
     def __setstate__(self, state):
-        (
-            self.num_tokens,
-            self.num_prompt_tokens,
-            self.num_cached_tokens,
-            self.block_table,
-            last_token_or_ids
-        ) = state
-        # Check if this is prefill (num_completion_tokens == 0) or decode phase
-        num_completion_tokens = self.num_tokens - self.num_prompt_tokens
-        if num_completion_tokens == 0:
-            # Prefill: last_token_or_ids is the full token_ids list
-            self.token_ids = last_token_or_ids
-        else:
-            # Decode: last_token_or_ids is just the last token
-            self.token_ids = [last_token_or_ids]
-        # Restore last_token attribute
-        self.last_token = self.token_ids[-1] if self.token_ids else None
+        self.__dict__.update(state)

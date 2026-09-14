@@ -24,6 +24,15 @@ def worker_process(config, rank, event):
 
 class LLMEngine:
     def __init__(self, config: dict):
+        config = dict(config)
+        # Canonical limits are shared by scheduler, warmup and CUDA graphs.
+        config.setdefault("max_num_batched_tokens", config.get("max_num_batch_tokens", 1024))
+        config.setdefault("max_num_sequences", config.get("max_num_seqs", 16))
+        for key in ("max_num_batched_tokens", "max_num_sequences", "max_model_length", "block_size"):
+            if config[key] <= 0:
+                raise ValueError(f"{key} must be positive")
+        if config.get("long_prefill_token_threshold", 0) < 0:
+            raise ValueError("long_prefill_token_threshold must be nonnegative")
         self.config = config
         world_size = config.get("world_size", 1)
         ctx = mp.get_context("spawn")
@@ -49,44 +58,45 @@ class LLMEngine:
             max_num_batched_tokens=config.get("max_num_batched_tokens", 1024),
             max_cached_blocks=config.get("max_cached_blocks", 1024),
             block_size=config.get("block_size", 256),
-            eos=config.get("eos", 50256)
+            eos=config.get("eos", 50256),
+            long_prefill_token_threshold=config.get("long_prefill_token_threshold", 0)
         )
 
         atexit.register(self.exit)
 
 
     def exit(self):
+        if not hasattr(self, "model_runner"):
+            return
+        atexit.unregister(self.exit)
         self.model_runner.call("exit")
         del self.model_runner
         for process in self.processes:
             process.join()
 
-    # call scheduler to schedule the next batch
-    # return scheduled sequences and whether it is for prefilling
-    # call model_runner.run() to run the model
-    # call postprocessor to process the outputs and update sequences and update block manager
+    # Execute the unified token batch, then commit KV progress and sampled outputs.
     def step(self) -> tuple[list[tuple[int, list[int]]], int, bool]:
-        scheduled_sequences, is_prefill = self.scheduler.schedule()
-        num_processed_tokens = 0
-        if not scheduled_sequences:
-            return [], num_processed_tokens, is_prefill
-        # run the model
-        outputs = self.model_runner.call("run", scheduled_sequences, is_prefill)
-        # Move outputs to CPU and convert them to a list
-        if outputs is not None:
-            outputs = outputs.cpu().tolist()
-        # postprocess the outputs
-        self.scheduler.postprocess(scheduled_sequences, outputs)
-
-        outputs = [(seq.seq_id, seq.completion_token_ids) for seq in scheduled_sequences if seq.is_finished]
-        num_processed_tokens = sum(len(seq) for seq in scheduled_sequences) if is_prefill else len(scheduled_sequences)
-
+        batch = self.scheduler.schedule()
+        # Compatibility: this flag includes mixed/partial-prefill iterations.
+        is_prefill = not batch.is_decode_only
+        num_processed_tokens = batch.num_scheduled_tokens
+        if not batch.requests:
+            return [], 0, is_prefill
+        token_ids = self.model_runner.call("run", batch)
+        self.scheduler.postprocess(batch, token_ids.cpu().tolist())
+        outputs = [(r.sequence.seq_id, r.sequence.completion_token_ids)
+                   for r in batch.requests if r.sequence.is_finished]
         return outputs, num_processed_tokens, is_prefill
 
 
     # add prompt string to the waiting queue by first transforming it to Sequence object
     def add_prompt(self, prompt: str, sampling_params: SamplingParams) -> None:
-        self.scheduler.add_sequence(Sequence(token_ids=self.tokenizer.encode(prompt), block_size=self.config['block_size'],sampling_params=sampling_params))
+        from dataclasses import replace
+        model_limit = self.config['max_model_length']
+        params = replace(sampling_params, max_model_length=min(
+            sampling_params.max_model_length or model_limit, model_limit))
+        self.scheduler.add_sequence(Sequence(token_ids=self.tokenizer.encode(prompt),
+                                            block_size=self.config['block_size'], sampling_params=params))
 
     # given a list of prompts
     # add_prompt for each prompt
@@ -102,7 +112,7 @@ class LLMEngine:
             end_t = time.time()
             running_time = end_t - start_t + 1e-10
             if is_prefill:
-                print(num_processed_tokens, 'number of processed tokens', num_processed_tokens/running_time, "tokens/sec during prefilling")
+                print(num_processed_tokens, 'number of processed tokens', num_processed_tokens/running_time, "tokens/sec during prefill/mixed execution")
             else:
                 print(num_processed_tokens, 'number of processed tokens', num_processed_tokens/running_time, "tokens/sec during decoding")
             generated_tokens.update({seq_id: tokens for seq_id, tokens in outputs})

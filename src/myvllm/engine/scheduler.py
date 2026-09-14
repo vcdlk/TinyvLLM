@@ -1,118 +1,159 @@
 from collections import deque
+from dataclasses import dataclass
+
 from myvllm.engine.sequence import Sequence, SequenceStatus
 from myvllm.engine.block_manager import BlockManager
 
 
+@dataclass(frozen=True)
+class ScheduledSequence:
+    sequence: Sequence
+    start: int
+    num_tokens: int
+
+    @property
+    def end(self) -> int:
+        return self.start + self.num_tokens
+
+    @property
+    def should_sample(self) -> bool:
+        return self.end == len(self.sequence)
+
+
+@dataclass
+class SchedulerOutput:
+    requests: list[ScheduledSequence]
+
+    @property
+    def num_scheduled_tokens(self) -> int:
+        return sum(request.num_tokens for request in self.requests)
+
+    @property
+    def is_decode_only(self) -> bool:
+        return bool(self.requests) and all(
+            r.num_tokens == 1 and r.start > 0 and r.should_sample
+            for r in self.requests
+        )
+
+
 class Scheduler:
-    def __init__(self, max_num_sequences: int, max_num_batched_tokens: int, max_cached_blocks: int, block_size: int, eos: int):
-        # block manager
+    """Running-first token-budget scheduling, with incremental KV allocation.
+
+    Prefill, partial prefill and decode all advance the same computed cursor.
+    Running requests retain FCFS order; waiting requests use the remaining budget.
+    """
+
+    def __init__(self, max_num_sequences: int, max_num_batched_tokens: int,
+                 max_cached_blocks: int, block_size: int, eos: int,
+                 long_prefill_token_threshold: int = 0):
+        if min(max_num_sequences, max_num_batched_tokens, max_cached_blocks, block_size) <= 0:
+            raise ValueError("Scheduler limits and block_size must be positive")
+        if long_prefill_token_threshold < 0:
+            raise ValueError("long_prefill_token_threshold must be nonnegative")
+        self.long_prefill_token_threshold = long_prefill_token_threshold
         self.block_manager = BlockManager(max_cached_blocks, block_size)
         self.max_num_batched_tokens = max_num_batched_tokens
         self.max_num_sequences = max_num_sequences
-        # sequence queue
         self.waiting: deque[Sequence] = deque()
         self.running: deque[Sequence] = deque()
         self.eos = eos
 
-
     def is_finished(self):
-        return len(self.waiting) == 0 and len(self.running) == 0
-    
+        return not self.waiting and not self.running
+
     def add_sequence(self, sequence: Sequence):
-        # Reject up front what the block manager could never satisfy, otherwise the
-        # sequence sits in `waiting` forever and only surfaces as a stalled engine.
-        capacity = len(self.block_manager.blocks)
-        if sequence.num_blocks > capacity:
-            raise ValueError(
-                f"Sequence {sequence.seq_id} needs {sequence.num_blocks} blocks "
-                f"({len(sequence)} tokens at block_size={self.block_manager.block_size}) "
-                f"but the KV cache only holds {capacity}. "
-                f"Raise max_cached_blocks or block_size, or shorten the prompt."
-            )
+        if not len(sequence):
+            raise ValueError("Prompt must contain at least one token")
+        if sequence.block_size != self.block_manager.block_size:
+            raise ValueError("Sequence and scheduler block_size must match")
+        if sequence.max_tokens <= 0:
+            raise ValueError("max_tokens must be positive")
+        if sequence.max_model_length is not None and len(sequence) >= sequence.max_model_length:
+            raise ValueError("Prompt must leave room for output within max_model_length")
+        self._check_capacity(sequence)
         self.waiting.append(sequence)
 
-
-    def schedule(self) -> tuple[list[Sequence], bool]:
-        scheduled_sequences = []
-        current_scheduled_tokens = 0
-        # An empty schedule is only legitimate when this call freed blocks by
-        # preempting, so the next call can make progress. See the guard below.
-        preempted = False
-        # try schedule for prefilling from waiting queue if not exceeding limits
-        while self.waiting and len(scheduled_sequences) < self.max_num_sequences:
-            seq = self.waiting[0]
-            if self.block_manager.can_allocate(seq) and len(seq) + current_scheduled_tokens <= self.max_num_batched_tokens:
-                seq = self.waiting.popleft() # remove from waiting
-                self.block_manager.allocate(seq)
-                seq.status = SequenceStatus.RUNNING
-                self.running.append(seq)
-                scheduled_sequences.append(seq)
-                current_scheduled_tokens += len(seq)
-            else:
-                break
-        if scheduled_sequences:
-            return scheduled_sequences, True
-        
-        # try schedule for completion from running queue
-        while self.running:
-            seq = self.running.popleft()
-            # use can_append to check whether we can append one more token
-            if not self.block_manager.can_append(seq):
-                preempted = True
-                if self.running:
-                    self.running.appendleft(seq)
-                    self.preempt(self.running.pop())
-                else:
-                    self.preempt(seq)
-                    break
-            else:
-                if current_scheduled_tokens >= self.max_num_batched_tokens or len(scheduled_sequences) >= self.max_num_sequences:
-                    self.running.appendleft(seq)
-                    break
-                # append one token
-                self.block_manager.append(seq)
-                scheduled_sequences.append(seq)
-                current_scheduled_tokens += 1 # only one token for completion
-
-        # re-add to running queue in the same order
-        if scheduled_sequences:
-            self.running.extendleft(reversed(scheduled_sequences))
-        elif not preempted and (self.waiting or self.running):
-            # Nothing was scheduled and nothing was preempted, so no engine state
-            # changed: every later schedule() would take the same decisions and
-            # LLMEngine.generate() would spin forever. Fail loudly instead.
-            raise RuntimeError(
-                "Scheduler made no progress: "
-                f"{len(self.waiting)} waiting and {len(self.running)} running sequences, "
-                f"{len(self.block_manager.free_block_ids)} of "
-                f"{len(self.block_manager.blocks)} blocks free. "
-                "This means either a sequence that cannot fit in the KV cache, or "
-                "blocks leaked because their ref_count never returned to 0."
+    def _check_capacity(self, seq: Sequence):
+        if seq.num_blocks > len(self.block_manager.blocks):
+            raise ValueError(
+                f"Sequence {seq.seq_id} needs {seq.num_blocks} blocks but the KV cache "
+                f"only holds {len(self.block_manager.blocks)}. Increase cache capacity "
+                "or reduce the prompt/output length."
             )
 
-        return scheduled_sequences, False
+    def _token_grant(self, seq: Sequence, budget: int) -> int:
+        pending = len(seq) - seq.num_computed_tokens
+        if self.long_prefill_token_threshold:
+            pending = min(pending, self.long_prefill_token_threshold)
+        return min(pending, budget)
 
+    def schedule(self) -> SchedulerOutput:
+        requests = []
+        budget = self.max_num_batched_tokens
+        preempted = False
+        # Only unscheduled requests can be evicted: blocks referenced by this
+        # output must stay allocated until the forward pass has completed.
+        index = 0
+        while index < len(self.running) and budget > 0:
+            seq = self.running[index]
+            self._check_capacity(seq)
+            n = self._token_grant(seq, budget)
+            assert n > 0, "Call postprocess before scheduling the next step"
+            while not self.block_manager.can_allocate_slots(seq, n):
+                victim = self.running.pop()
+                self.preempt(victim)
+                preempted = True
+                if victim is seq:
+                    break
+            else:
+                self.block_manager.allocate_slots(seq, n)
+                requests.append(ScheduledSequence(seq, seq.num_computed_tokens, n))
+                budget -= n
+                index += 1
+                continue
+            break
+
+        # Don't immediately readmit an evicted request in the same iteration.
+        while (not preempted and self.waiting and budget > 0
+               and len(self.running) < self.max_num_sequences):
+            seq = self.waiting[0]
+            self._check_capacity(seq)
+            n = self._token_grant(seq, budget)
+            if not self.block_manager.can_allocate_slots(seq, n):
+                break
+            self.block_manager.allocate_slots(seq, n)
+            self.waiting.popleft()
+            seq.status = SequenceStatus.RUNNING
+            self.running.append(seq)
+            requests.append(ScheduledSequence(seq, seq.num_computed_tokens, n))
+            budget -= n
+
+        if not requests and not preempted and not self.is_finished():
+            raise RuntimeError("Scheduler made no progress; check KV block ownership")
+        return SchedulerOutput(requests)
 
     def preempt(self, seq: Sequence) -> None:
         self.block_manager.deallocate(seq)
         seq.status = SequenceStatus.WAITING
-        self.waiting.appendleft(seq)        
+        self.waiting.appendleft(seq)
 
-
-    # postprocess after generation to check whether sequences are finished
-    # if finished, deallocate blocks
-    def postprocess(self, seqs: list[Sequence], token_ids: list[int]) -> None:
-        for seq, token_id in zip(seqs, token_ids):
+    def postprocess(self, output: SchedulerOutput, token_ids: list[int]) -> None:
+        # Only final chunks have logits eligible for sampling. Validate before
+        # mutating any request so an incomplete runner response cannot lose work.
+        eligible = [r.should_sample for r in output.requests]
+        if len(token_ids) != sum(eligible):
+            raise ValueError("Expected one sampled token per completed input, not per chunk")
+        tokens = iter(token_ids)
+        for request, sample in zip(output.requests, eligible):
+            seq = request.sequence
+            seq.num_computed_tokens = request.end
+            if not sample:
+                continue
+            token_id = next(tokens)
             seq.append_token(token_id)
-            # Check stopping conditions:
-            # EOS token
-            # Reached max_tokens limit (number of completion tokens)
-            # Reached max_model_length limit (total sequence length including prompt)
-            stop_due_to_eos = not seq.ignore_eos and token_id == self.eos
-            stop_due_to_max_tokens = seq.num_completion_tokens >= seq.max_tokens
-            stop_due_to_max_length = seq.max_model_length is not None and seq.num_tokens >= seq.max_model_length
-
-            if stop_due_to_eos or stop_due_to_max_tokens or stop_due_to_max_length:
+            if ((not seq.ignore_eos and token_id == self.eos)
+                or seq.num_completion_tokens >= seq.max_tokens
+                or (seq.max_model_length is not None and len(seq) >= seq.max_model_length)):
                 seq.status = SequenceStatus.FINISHED
                 self.block_manager.deallocate(seq)
                 self.running.remove(seq)

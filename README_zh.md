@@ -15,6 +15,16 @@
 
 **第一次接触vLLM?** 阅读 [HowToApproachvLLM_zh.md](HowToApproachvLLM_zh.md) 从零开始实现vLLM！学习vLLM中layers、models、Pageattention、FlashAttention、CUDA graphs以及调度实现。
 
+## Chunked prefill 与 Unified scheduling
+
+默认启用按 token 预算分块的 prefill，可与 decode 同批执行。KV 按 chunk 增长，中间 chunk 不采样；Qwen3 与 Llama 使用连续位置编号及历史分页 KV。调度器先处理 running 请求，再用剩余预算接纳 waiting 请求。
+
+可用 `long_prefill_token_threshold` 限制单请求每轮处理量（默认 0，不额外限制）。新增 `benchmark_scheduling.py` 可测量首 token 延迟、token 间延迟和输出吞吐；`--dry-run` 可在 CPU 上预览测试配置。
+
+设置 `max_num_batched_tokens` 控制每轮输入预算，它可以小于 prompt 长度。纯 decode 保留 CUDA graph 路径。当前使用请求独占 KV 块，不支持跨请求 prefix caching。
+
+实现思路、vLLM 源码参考、配置和验证边界见 [改造说明](docs/unified_scheduling.md)。运行测试：`python3 -m unittest discover -s tests -v`（无 CUDA 环境会跳过 GPU 数值测试）。
+
 ## 快速开始
 
 ```bash

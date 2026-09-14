@@ -4,6 +4,7 @@ import torch
 
 @dataclass
 class Context:
+    # True selects the variable-query path, including mixed prefill/decode.
     is_prefill: bool = False
     cu_seqlens_q: torch.Tensor | None = None
     cu_seqlens_k: torch.Tensor | None = None
@@ -12,6 +13,7 @@ class Context:
     slot_mapping: torch.Tensor | None = None
     context_lens: torch.Tensor | None = None
     block_tables: torch.Tensor | None = None
+    positions: torch.Tensor | None = None
 
 _context = Context()
 
@@ -22,6 +24,6 @@ def reset_context():
     global _context
     _context = Context()
 
-def set_context(is_prefill, cu_seqlens_q=None, cu_seqlens_k=None, max_seqlen_q=0, max_seqlen_k=0, slot_mapping=None, context_lens=None, block_tables=None):
+def set_context(is_prefill, cu_seqlens_q=None, cu_seqlens_k=None, max_seqlen_q=0, max_seqlen_k=0, slot_mapping=None, context_lens=None, block_tables=None, positions=None):
     global _context
-    _context = Context(is_prefill, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, slot_mapping, context_lens, block_tables)
+    _context = Context(is_prefill, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, slot_mapping, context_lens, block_tables, positions)
