@@ -72,9 +72,12 @@ def load_minimind_checkpoint(model, path):
         raise ValueError('Expected safetensors checkpoint; convert raw .pth/.bin first')
     weights = {}
     for filename in files:
-        file = (root / filename).resolve()
-        if not file.is_relative_to(root.resolve()):
+        # Validate the shard name (not the resolved target) so path traversal is
+        # still rejected while HF cache symlinks pointing into blobs/ are allowed.
+        name_path = Path(filename)
+        if name_path.is_absolute() or '..' in name_path.parts:
             raise ValueError('Checkpoint shard must be inside checkpoint directory')
+        file = root / name_path
         with safe_open(file, framework='pt', device='cpu') as shard:
             for name in shard.keys():
                 if name in weights:
