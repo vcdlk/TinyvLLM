@@ -104,3 +104,4 @@ myvllm/
 ## Star History
 
 [![Star History Chart](https://star-history.dera.page/svg?repos=Wenyueh/MinivLLM&type=date&legend=top-left)](https://star-history.dera.page/?utm_source=chatgpt.com#Wenyueh/MinivLLM&type=date&legend=top-left)
+Experimental MiniMind-3-MoE support (single-GPU eager) is described in the [implementation and validation notes](docs/minimind-3-moe-support.md). Run `python main_minimind.py` on Linux CUDA; a standalone CPU parity checker is provided for macOS.

@@ -13,7 +13,8 @@ def store_kvcache_kernel(
     slot_mapping_ptr,
     num_kv_heads: tl.constexpr,
     head_dim: tl.constexpr,
-    block_size: tl.constexpr
+    block_size: tl.constexpr,
+    BLOCK_D: tl.constexpr,
 ):
     """
     Store keys and values into paged KV cache.
@@ -40,7 +41,7 @@ def store_kvcache_kernel(
     
     # it creates a vector [0, 1, ..., head_dim-1]
     # Load key and value for this token and head
-    head_offsets = tl.arange(0, head_dim)
+    head_offsets = tl.arange(0, BLOCK_D)
     # Input: (num_tokens, num_kv_heads, head_dim)
     # example: input_offset = 5 * (8 * 128) + 3 * 128 + [0, 1, 2, ..., 127]
     #         = 5120 + 384 + [0, 1, 2, ..., 127]
@@ -56,12 +57,12 @@ def store_kvcache_kernel(
                    head_offsets) 
     
     # load key and value value floats from the pointers's memory
-    key = tl.load(key_ptr + input_offset)
-    value = tl.load(value_ptr + input_offset)
+    key = tl.load(key_ptr + input_offset, mask=head_offsets < head_dim, other=0)
+    value = tl.load(value_ptr + input_offset, mask=head_offsets < head_dim, other=0)
     
     # store into cache
-    tl.store(k_cache_ptr + cache_offset, key)
-    tl.store(v_cache_ptr + cache_offset, value)
+    tl.store(k_cache_ptr + cache_offset, key, mask=head_offsets < head_dim)
+    tl.store(v_cache_ptr + cache_offset, value, mask=head_offsets < head_dim)
 
 
 def store_kvcache(
@@ -104,7 +105,8 @@ def store_kvcache(
         slot_mapping,
         num_kv_heads=num_kv_heads,
         head_dim=head_dim,
-        block_size=block_size
+        block_size=block_size,
+        BLOCK_D=triton.next_power_of_2(head_dim),
     )
 
 
@@ -295,6 +297,7 @@ def paged_attention_decode_kernel(
     block_size: tl.constexpr,
     max_num_blocks: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    BLOCK_D: tl.constexpr,
 ):
     """
     Optimized paged attention kernel for decode phase.
@@ -316,12 +319,12 @@ def paged_attention_decode_kernel(
     context_len = tl.load(context_lens_ptr + batch_idx)
     
     # Load query: (batch_size, num_heads, head_dim)
-    offs_d = tl.arange(0, head_dim)
+    offs_d = tl.arange(0, BLOCK_D)
     q_offset = batch_idx * num_heads * head_dim + head_idx * head_dim + offs_d
-    q = tl.load(query_ptr + q_offset)
+    q = tl.load(query_ptr + q_offset, mask=offs_d < head_dim, other=0)
     
     # Initialize accumulators
-    acc = tl.zeros([head_dim], dtype=tl.float32)
+    acc = tl.zeros([BLOCK_D], dtype=tl.float32)
     l_i = 0.0
     m_i = -1e10
     
@@ -362,7 +365,7 @@ def paged_attention_decode_kernel(
                          + offs_d[:, None])
 
             # Compute attention scores for this chunk
-            k = tl.load(k_cache_ptr + kv_offset, mask=valid[None, :], other=0.0)
+            k = tl.load(k_cache_ptr + kv_offset, mask=valid[None, :] & (offs_d[:, None] < head_dim), other=0.0)
             k = tl.cast(k, tl.float32)
             score = tl.sum(q[:, None] * k, axis=0) * scale
             qk = tl.where(valid, score, -1e10)
@@ -378,7 +381,7 @@ def paged_attention_decode_kernel(
             l_i = l_i * alpha
 
             # Accumulate weighted values
-            v = tl.load(v_cache_ptr + kv_offset, mask=valid[None, :], other=0.0)
+            v = tl.load(v_cache_ptr + kv_offset, mask=valid[None, :] & (offs_d[:, None] < head_dim), other=0.0)
             v = tl.cast(v, tl.float32)
             weight = tl.where(valid, p, 0.0)
             acc = acc + tl.sum(weight[None, :] * v, axis=1)
@@ -391,7 +394,7 @@ def paged_attention_decode_kernel(
     
     # Store output
     output_offset = batch_idx * num_heads * head_dim + head_idx * head_dim + offs_d
-    tl.store(output_ptr + output_offset, output)
+    tl.store(output_ptr + output_offset, output, mask=offs_d < head_dim)
 
 
 def paged_attention_decode(
@@ -447,6 +450,7 @@ def paged_attention_decode(
         block_size=block_size,
         max_num_blocks=max_num_blocks,
         BLOCK_N=BLOCK_N,
+        BLOCK_D=triton.next_power_of_2(head_dim),
     )
     
     return output

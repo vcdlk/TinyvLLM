@@ -24,6 +24,8 @@ def worker_process(config, rank, event):
 
 class LLMEngine:
     def __init__(self, config: dict):
+        from myvllm.models.registry import prepare_model_config
+        config = prepare_model_config(config)
         self.config = config
         world_size = config.get("world_size", 1)
         ctx = mp.get_context("spawn")

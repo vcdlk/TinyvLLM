@@ -23,13 +23,20 @@ class ModelRunner:
         self.enforce_eager = config.get('enforce_eager', False)
 
         self.rank = rank
+        if config.get('model_architecture') == 'MiniMindMoeForCausalLM':
+            if self.world_size != 1 or not self.enforce_eager:
+                raise ValueError('MiniMind MoE requires single-GPU eager inference')
+            torch.set_default_dtype(getattr(torch, config['dtype']))
         dist.init_process_group('nccl', "tcp://localhost:12345", world_size=config['world_size'], rank=rank)
         torch.cuda.set_device(rank)
 
         # set model
         path_str = self.config['model_name_or_path']
-        model_name = Path(path_str).name
+        model_name = config.get('model_architecture', Path(path_str).name)
         match model_name:
+            case 'MiniMindMoeForCausalLM':
+                from myvllm.models.minimind_moe import MiniMindMoeForCausalLM
+                self.model = MiniMindMoeForCausalLM(config['hf_config'], self.block_size)
             case 'Qwen3-0.6B':
                 self.model = Qwen3ForCausalLM(
                     vocab_size=config['vocab_size'],
@@ -69,7 +76,7 @@ class ModelRunner:
                 raise Exception(f"Unsupported model: {config['model_name_or_path']}")
 
         # Load weights in GPU (model moved to GPU before loading weights)
-        self.model = self.model.cuda(rank)
+        self.model = self.model.cuda(rank).eval()
 
         # Load pretrained weights if model_name_or_path is provided
         if config.get('model_name_or_path'):
@@ -279,6 +286,11 @@ class ModelRunner:
         block_tables = []
         for seq in seqs:
             token_ids = seq.token_ids
+            # A full prefix hit still needs one block replayed to obtain logits.
+            # This only changes prefill metadata, not block ownership/refcounts.
+            if (self.config.get('model_architecture') == 'MiniMindMoeForCausalLM'
+                    and seq.num_cached_tokens == len(token_ids)):
+                seq.num_cached_tokens = max(0, seq.num_cached_tokens - self.block_size)
             num_cached_tokens = seq.num_cached_tokens
             input_ids.extend(token_ids[num_cached_tokens:])
             seqlens_q.append(len(token_ids) - num_cached_tokens)
