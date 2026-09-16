@@ -1,107 +1,58 @@
-<p align="center">
-  <img src="./assets/minivllm.png" alt="MinivLLM" width="50%" height="50%">
-</p>
+# TinyvLLM
 
-<p align="center">
-| <a href="./README.md"><b>English</b></a> 
-| <a href="./README_zh.md"><b>简体中文</b></a> |
-</p>
+![TinyvLLM](assets/tinyvllm.png)
 
-# miniVLLM
+[English](README.md) | [简体中文](README_zh.md)
 
-A custom implementation of vLLM inference engine with attention mechanism benchmarks, based on Nano-vLLM but with self-contained paged attention and flash attention implementation. 
+A lightweight LLM inference engine based on Nano-vLLM, built for learning inference workflows and performance optimization.
 
-Benchmarking on flash attention in prefilling time and paged attention in decoding time are provided.
+## Features
 
-**New to vLLM?** Check out [HowToApproachvLLM.md](HowToApproachvLLM.md) for a step-by-step implementation guide covering layers, models, paged attention, CUDA graphs, and scheduling.
+- Supports Qwen3-0.6B, Llama-3.2-1B-Instruct, and MiniMind-3-MoE with pretrained weights for text generation.
+- **Unified Scheduling**: Prefill and Decode share a token budget and can run in the same batch.
+- **Chunked Prefill**: Long inputs are processed in chunks within the token budget, with KV cache allocated on demand.
+- Implements paged KV cache, Triton Flash Attention, and Paged Attention; MiniMind uses PyTorch SDPA for Prefill.
+- Supports multi-GPU tensor parallelism and CUDA Graphs, with attention and inference throughput benchmarks.
 
-## Quickstart
+Unified Scheduling and Chunked Prefill are available on the `unified_scheduler` branch and have not yet been merged into the current branch.
+
+## Getting Started
+
+Requires Linux, an NVIDIA GPU with CUDA, Python 3.11, and uv. Models are downloaded on the first run;
 
 ```bash
-# Install uv package manager
-curl -LsSf https://astral.sh/uv/install.sh | sh
-
-# Sync dependencies
 uv sync
 
-# Run the main inference engine
+# Qwen3 inference
 uv run python main.py
 
-# Run prefilling benchmark
+# Llama 3.2 inference
+uv run python main_llama32.py
+
+# MiniMind-3-MoE inference
+uv run python main_minimind.py
+```
+
+Set the execution mode in the corresponding script's `config`, then run the same commands above:
+
+| Configuration           | Execution mode                                                                     |
+| ----------------------- | ---------------------------------------------------------------------------------- |
+| `world_size = 1`        | Single GPU (default)                                                               |
+| `world_size = N`        | Tensor parallelism across N GPUs; the engine starts worker processes automatically |
+| `enforce_eager = True`  | Eager execution (default)                                                          |
+| `enforce_eager = False` | CUDA Graphs during Decode                                                          |
+
+The `unified_scheduler` branch enables Unified Scheduling and Chunked Prefill by default. `max_num_batched_tokens` sets the total token budget per iteration; `long_prefill_token_threshold` caps tokens per request per iteration (0 means no additional limit).
+
+## Benchmarks
+
+```bash
+# Prefill attention comparison
 uv run python benchmark_prefilling.py
 
-# Run decoding benchmark
+# Decode attention comparison
 uv run python benchmark_decoding.py
+
+# TinyvLLM, vLLM, and Transformers throughput comparison
+uv run python benchmark_tps.py
 ```
-
-To run multi-GPU setting, simply change world_size to n > 1 in config in main.py
-
-## What Each Script Does
-
-```bash
-uv run python main.py
-```
-
-This is the main inference engine demo
-
-Demonstrates the complete LLM inference pipeline using a custom engine implementation:
-- Create a small version of Qwen3 with random initialization
-- Creates 60 chat prompts (2 base prompts repeated 30 times each)
-- Processes them through the custom LLM engine with batch processing
-- Uses paged attention and KV cache management for efficient inference
-- Generates up to 256 tokens per prompt with temperature sampling
-
-This showcases how the custom vLLM implementation handles batched text generation with memory-efficient attention.
-
-```bash
-uv run python benchmark_prefilling.py
-```
-
-This is the prefilling phase comparison
-
-Compares three attention implementations during the **prefilling phase** (processing input prompts):
-
-1. **PyTorch Standard (O(N²) memory)**: Traditional attention that materializes full attention matrix
-2. **Naive Triton (O(N²) memory)**: GPU kernel that also uses O(N²) memory, limited by shared memory constraints (≤128 tokens)
-3. **Flash Attention (O(N) memory)**: Memory-efficient online softmax algorithm that processes attention in blocks
-
-```bash
-uv run python benchmark_decoding.py
-```
-
-This is the decoding phase comparison
-
-Compares three implementations during the **decoding phase** (generating output tokens one at a time):
-
-1. **Naive PyTorch**: Simple loop-based implementation using paged KV cache
-2. **Optimized PyTorch**: Vectorized implementation with batch gathering and masking
-3. **Triton Kernel**: Custom GPU kernel optimized for paged attention decode
-
-
-## Project Structure
-
-```
-myvllm/
-├── src/
-│   └── myvllm/           # Core vLLM implementation
-│       ├── models/       # Model implementations
-│       ├── engine/       # LLM engine logic, including sequence definition for input prompts, block management for KV cache management for GPU, scheduler for iteration-based scheduling of sequences, runner for actual implementation of running prefilling and decoding, and engine for generation API interface
-│       ├── layers/       # Model layer components (activation, attention, embeddings, etc.)
-│       ├── utils/        # Utility helpers and inference context management
-│       └── sampling_parameters.py
-├── main.py              # Full inference demo
-├── benchmark_prefilling.py   # Prefilling attention comparison
-└── benchmark_decoding.py     # Decoding attention comparison
-```
-
-## Requirements
-
-- Python ≥3.11, < 3.12
-- CUDA-capable GPU
-- Dependencies: `transformers`, `torch`, `xxhash` (managed by uv)
-
-
-## Star History
-
-[![Star History Chart](https://star-history.dera.page/svg?repos=Wenyueh/MinivLLM&type=date&legend=top-left)](https://star-history.dera.page/?utm_source=chatgpt.com#Wenyueh/MinivLLM&type=date&legend=top-left)
-Experimental MiniMind-3-MoE support (single-GPU eager) is described in the [implementation and validation notes](docs/minimind-3-moe-support.md). Run `python main_minimind.py` on Linux CUDA; a standalone CPU parity checker is provided for macOS.
