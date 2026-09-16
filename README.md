@@ -1,45 +1,58 @@
 # TinyvLLM
 
-基于 Nano-vLLM 的轻量级大模型推理引擎，用于学习推理流程和性能优化。
+![TinyvLLM](assets/tinyvllm.png)
 
-## 做了什么
+[English](README.md) | [简体中文](README_zh.md)
 
-- 支持 Qwen3-0.6B、Llama-3.2-1B-Instruct，加载预训练权重进行文本生成。
-- 实现批量调度、分页 KV Cache，以及 Triton Flash Attention（Prefill）和 Paged Attention（Decode）。
-- 支持多 GPU 张量并行和 CUDA Graph，提供注意力及推理吞吐量基准测试。
+A lightweight LLM inference engine based on Nano-vLLM, built for learning inference workflows and performance optimization.
 
-## 运行方式
+## Features
 
-需要 Linux、NVIDIA GPU（CUDA）、Python 3.11 和 uv。首次运行会下载模型，Llama 模型需具备 Hugging Face 访问权限。
+- Supports Qwen3-0.6B, Llama-3.2-1B-Instruct, and MiniMind-3-MoE with pretrained weights for text generation.
+- **Unified Scheduling**: Prefill and Decode share a token budget and can run in the same batch.
+- **Chunked Prefill**: Long inputs are processed in chunks within the token budget, with KV cache allocated on demand.
+- Implements paged KV cache, Triton Flash Attention, and Paged Attention; MiniMind uses PyTorch SDPA for Prefill.
+- Supports multi-GPU tensor parallelism and CUDA Graphs, with attention and inference throughput benchmarks.
+
+Unified Scheduling and Chunked Prefill are available on the `unified_scheduler` branch and have not yet been merged into the current branch.
+
+## Getting Started
+
+Requires Linux, an NVIDIA GPU with CUDA, Python 3.11, and uv. Models are downloaded on the first run;
 
 ```bash
 uv sync
 
-# Qwen3 推理
+# Qwen3 inference
 uv run python main.py
 
-# Llama 3.2 推理
+# Llama 3.2 inference
 uv run python main_llama32.py
+
+# MiniMind-3-MoE inference
+uv run python main_minimind.py
 ```
 
-在对应脚本的 `config` 中设置运行模式，修改后仍使用上面的命令启动：
+Set the execution mode in the corresponding script's `config`, then run the same commands above:
 
-| 配置                    | 运行模式                                |
-| ----------------------- | --------------------------------------- |
-| `world_size = 1`        | 单 GPU（默认）                          |
-| `world_size = N`        | N 张 GPU 张量并行，由引擎自动启动子进程 |
-| `enforce_eager = True`  | Eager 执行（默认）                      |
-| `enforce_eager = False` | Decode 阶段使用 CUDA Graph              |
+| Configuration           | Execution mode                                                                     |
+| ----------------------- | ---------------------------------------------------------------------------------- |
+| `world_size = 1`        | Single GPU (default)                                                               |
+| `world_size = N`        | Tensor parallelism across N GPUs; the engine starts worker processes automatically |
+| `enforce_eager = True`  | Eager execution (default)                                                          |
+| `enforce_eager = False` | CUDA Graphs during Decode                                                          |
 
-## 性能测试
+The `unified_scheduler` branch enables Unified Scheduling and Chunked Prefill by default. `max_num_batched_tokens` sets the total token budget per iteration; `long_prefill_token_threshold` caps tokens per request per iteration (0 means no additional limit).
+
+## Benchmarks
 
 ```bash
-# Prefill 注意力性能对比
+# Prefill attention comparison
 uv run python benchmark_prefilling.py
 
-# Decode 注意力性能对比
+# Decode attention comparison
 uv run python benchmark_decoding.py
 
-# TinyvLLM、vLLM、Transformers 吞吐量对比
+# TinyvLLM, vLLM, and Transformers throughput comparison
 uv run python benchmark_tps.py
 ```
