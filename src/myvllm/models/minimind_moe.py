@@ -213,3 +213,28 @@ class MiniMindMoeForCausalLM(nn.Module):
     def load_checkpoint(self, path):
         from myvllm.utils.minimind_loader import load_minimind_checkpoint
         return load_minimind_checkpoint(self, path)
+
+
+if __name__ == "__main__":
+    from myvllm.models.registry import validate_minimind_config
+    from myvllm.utils.context import set_context
+
+    config = validate_minimind_config(dict(
+        model_type='qwen3_moe',
+        vocab_size=50257,
+        hidden_size=768,
+        num_attention_heads=12,
+        num_key_value_heads=4,
+        head_dim=64,
+        intermediate_size=3072,
+        moe_intermediate_size=3072,
+        num_hidden_layers=2,
+        num_experts=4,
+        num_experts_per_tok=2,
+    ))
+    model = MiniMindMoeForCausalLM(config, block_size=256).cuda()
+    # varlen prefill: two length-16 sequences packed into a single 1D tensor
+    input_ids = torch.randint(0, 50257, (32,)).cuda()
+    bounds = torch.tensor([0, 16, 32], dtype=torch.int32).cuda()
+    set_context(is_prefill=True, cu_seqlens_q=bounds, cu_seqlens_k=bounds)
+    output = model(input_ids)
